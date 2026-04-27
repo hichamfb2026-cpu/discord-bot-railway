@@ -318,57 +318,111 @@ function buildStatsEmbed(s, opts = {}) {
   const start = new Date(s.weekStartTime);
   const end = new Date();
   const top = topPoster(s);
-  const topField = top
-    ? `<@${top.userId}> — **${fmtNum(top.count)}** منشور`
-    : "_لا يوجد منشورات بعد._";
 
+  // ── Period line ──────────────────────────────────────────────────────────
   const periodLine =
-    `\`${fmtRiyadhDate(start)}\`  →  \`${fmtRiyadhDate(end)}\`\n` +
-    `*(بتوقيت السعودية)*`;
+    `> 🕐  \`${fmtRiyadhDate(start)}\`\n` +
+    `> 🕗  \`${fmtRiyadhDate(end)}\`\n` +
+    `> *(بتوقيت المملكة العربية السعودية)*`;
+
+  // ── Stats rows ────────────────────────────────────────────────────────────
+  // Each stat gets its own inline field; three per row looks clean on desktop.
+  const fields = [
+    // Row 1 – period
+    {
+      name: "📅  الفترة الزمنية",
+      value: periodLine,
+      inline: false,
+    },
+    // Spacer
+    {
+      name: "\u200B",
+      value: "─────────────────────",
+      inline: false,
+    },
+    // Row 2 – three main counters
+    {
+      name: "📸  المنشورات",
+      value: [
+        `\`\`\``,
+        `${fmtNum(s.mediaPosts)}`,
+        `\`\`\``,
+        `*صورة / فيديو*`,
+      ].join("\n"),
+      inline: true,
+    },
+    {
+      name: "🗑️  محذوفة",
+      value: [
+        `\`\`\``,
+        `${fmtNum(s.deletedMessages)}`,
+        `\`\`\``,
+        `*رسالة مخالفة*`,
+      ].join("\n"),
+      inline: true,
+    },
+    {
+      name: "💬  مناقشات",
+      value: [
+        `\`\`\``,
+        `${fmtNum(s.threadsCreated)}`,
+        `\`\`\``,
+        `*thread مُنشأ*`,
+      ].join("\n"),
+      inline: true,
+    },
+    // Row 3 – two more counters + blank
+    {
+      name: "✨  التفاعلات",
+      value: [
+        `\`\`\``,
+        `${fmtNum(s.reactionsAdded)}`,
+        `\`\`\``,
+        `*إيموجي أُضيف*`,
+      ].join("\n"),
+      inline: true,
+    },
+    {
+      name: "⚙️  الأوامر",
+      value: [
+        `\`\`\``,
+        `${fmtNum(s.commandsUsed)}`,
+        `\`\`\``,
+        `*أمر نُفِّذ*`,
+      ].join("\n"),
+      inline: true,
+    },
+    {
+      name: "\u200B",
+      value: "\u200B",
+      inline: true,
+    },
+    // Spacer
+    {
+      name: "\u200B",
+      value: "─────────────────────",
+      inline: false,
+    },
+    // Row 4 – top poster (full width)
+    {
+      name: "🏆  نجم الأسبوع",
+      value: top
+        ? `> <@${top.userId}>\n> **${fmtNum(top.count)} منشور** هذا الأسبوع 🎉`
+        : "> *لم يُنشر أي محتوى هذا الأسبوع.*",
+      inline: false,
+    },
+  ];
 
   return {
-    title: opts.title || "📊 التقرير الأسبوعي للبوت",
-    description: `🗓️  **الفترة**\n${periodLine}`,
-    color: 0x5865f2, // Discord blurple
-    fields: [
-      {
-        name: "📸 المنشورات (صور/فيديو)",
-        value: `**${fmtNum(s.mediaPosts)}**`,
-        inline: true,
-      },
-      {
-        name: "🗑️ رسائل محذوفة",
-        value: `**${fmtNum(s.deletedMessages)}**`,
-        inline: true,
-      },
-      {
-        name: "💬 مناقشات أُنشئت",
-        value: `**${fmtNum(s.threadsCreated)}**`,
-        inline: true,
-      },
-      {
-        name: "✨ تفاعلات أُضيفت",
-        value: `**${fmtNum(s.reactionsAdded)}**`,
-        inline: true,
-      },
-      {
-        name: "⚙️ أوامر استُخدمت",
-        value: `**${fmtNum(s.commandsUsed)}**`,
-        inline: true,
-      },
-      {
-        name: "\u200B",
-        value: "\u200B",
-        inline: true,
-      },
-      {
-        name: "🏆 أكثر عضو نشاطاً هذا الأسبوع",
-        value: topField,
-        inline: false,
-      },
-    ],
+    title: opts.title || "📊  التقرير الأسبوعي",
+    description:
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+      "ملخص نشاط القناة خلال الأسبوع الماضي\n" +
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    color: 0x2b2d31, // dark sidebar (matches Discord dark theme)
+    fields,
     footer: {
-      text: "🤖 يصلك تقرير جديد كل خميس 8:00ص بتوقيت السعودية",
+      text: "⏰ التقرير التالي • الخميس 8:00 مساءً بتوقيت السعودية",
     },
     timestamp: new Date().toISOString(),
   };
@@ -680,7 +734,7 @@ async function handleCommand(message) {
     activeChannels.set(guildId, channelId);
     await sendMessage(
       channelId,
-      `✅ **تم تفعيل البوت في هذه القناة فقط** <#${channelId}>\nسيتم تجاهل جميع القنوات الأخرى في هذا السيرفر.`,
+      `✅ **تم تفعيل البوت في هذه القناة** <#${channelId}>\nسيتم تجاهل جميع القنوات الأخرى في هذا السيرفر.\n\n> 💡 يمكنك إلغاء التحديد في أي وقت بـ \`!قناة-الغاء\``,
     );
     return true;
   }
@@ -745,8 +799,10 @@ async function handleCommand(message) {
         "",
         "**الإحصائيات:**",
         "`!احصائيات` — عرض إحصائيات الأسبوع الجارية 🔒",
-        "📅 يُنشر تقرير أسبوعي تلقائي **داخل القناة النشطة** كل خميس الساعة 8:00 صباحاً (بتوقيت السعودية).",
+        "📅 يُنشر تقرير أسبوعي تلقائي **داخل القناة النشطة** كل خميس الساعة 8:00 مساءً (بتوقيت السعودية).",
         "   *(إن لم تُحدِّد قناة بـ `!قناة-تعيين`، سيُرسَل لك في الخاص)*",
+        "",
+        "⚠️ **البوت لا يعمل في أي قناة حتى يُشغَّل بـ `!قناة-تعيين`.**",
       ].join("\n");
 
     // Send the menu via DM so it doesn't pollute the posts channel,
@@ -1067,13 +1123,18 @@ async function handleMessageCreate(message) {
 
   // 1b. If this guild has an active channel pinned, ignore everything
   //     happening outside it.
+  //     If NO active channel has been set yet, the bot is locked entirely
+  //     until the owner runs !قناة-تعيين — this prevents accidental operation
+  //     in the wrong channel on first setup.
   const guildId = message.guild_id;
   if (guildId) {
     const activeId = activeChannels.get(guildId);
-    if (activeId && activeId !== message.channel_id) {
-      // Allow thread messages whose parent is the active channel? Threads
-      // are skipped anyway by later checks; a non-active channel simply
-      // means we do nothing here.
+    if (!activeId) {
+      // No channel configured yet — silently ignore all non-command messages.
+      return;
+    }
+    if (activeId !== message.channel_id) {
+      // A channel is set, but this message is in a different one — ignore.
       return;
     }
   }
@@ -1122,13 +1183,13 @@ process.on("unhandledRejection", (err) => {
 });
 
 // ===== Weekly stats report =====
-// Every Thursday at 08:00 Saudi Arabia time (UTC+3 → 05:00 UTC),
+// Every Thursday at 20:00 Saudi Arabia time (UTC+3 → 17:00 UTC),
 // DM each guild owner an elegant report of the past week's activity,
 // then reset that guild's counters.
-function msUntilNextThursday8AMRiyadh() {
+function msUntilNextThursday8PMRiyadh() {
   const now = new Date();
   const target = new Date();
-  target.setUTCHours(5, 0, 0, 0); // 05:00 UTC == 08:00 Riyadh
+  target.setUTCHours(17, 0, 0, 0); // 17:00 UTC == 20:00 Riyadh
   // Day-of-week in UTC: 0=Sun … 4=Thu
   let daysAhead = (4 - target.getUTCDay() + 7) % 7;
   if (daysAhead === 0 && now.getTime() >= target.getTime()) {
@@ -1175,7 +1236,7 @@ async function sendWeeklyReports() {
 }
 
 function scheduleWeeklyReports() {
-  const delay = msUntilNextThursday8AMRiyadh();
+  const delay = msUntilNextThursday8PMRiyadh();
   const hours = (delay / 3600000).toFixed(1);
   console.log(`[STATS] next weekly report in ~${hours}h`);
   setTimeout(() => {
