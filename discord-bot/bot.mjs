@@ -17,8 +17,7 @@ const DEFAULT_EMOJIS = [
   "<:emoji_4:1498045619128766696>",
 ];
 
-const DEFAULT_AUTO_COMMENT =
-  "💬 شاركونا آراءكم وتعليقاتكم بالرد على هذا المنشور!";
+const DEFAULT_AUTO_COMMENT = "💬 ناقشوا المنشور هنا — شاركونا آراءكم";
 
 let emojis = [...DEFAULT_EMOJIS];
 
@@ -456,12 +455,12 @@ async function handleCommand(message) {
         "`!فلتر-ايقاف` — ايقاف الفلتر في هذه القناة",
         "`!فلتر-حالة` — عرض حالة الفلتر والتعليق",
         "",
-        "**التعليق التلقائي (افتراضياً مفعّل — للمشرفين فقط):**",
-        "`!تعليق-تعيين <نص>` — تعيين تعليق مخصص",
-        "`!تعليق-افتراضي` — اعادة استخدام النص الافتراضي",
-        "`!تعليق-ايقاف` — ايقاف التعليق التلقائي",
-        "`!تعليق-تشغيل` — اعادة تشغيله",
-        "`!تعليق-عرض` — عرض النص الحالي",
+        "**التعليق التلقائي — يُنشأ كـ مناقشة (Thread) داخل كل صورة/فيديو (افتراضياً مفعّل — للمشرفين فقط):**",
+        "`!تعليق-تعيين <نص>` — تعيين عنوان مخصص للمناقشة",
+        "`!تعليق-افتراضي` — اعادة استخدام العنوان الافتراضي",
+        "`!تعليق-ايقاف` — ايقاف انشاء المناقشات",
+        "`!تعليق-تشغيل` — اعادة تشغيلها",
+        "`!تعليق-عرض` — عرض العنوان الحالي",
       ].join("\n"),
     );
     return true;
@@ -518,7 +517,21 @@ async function postAutoComment(message) {
   if (!hasMedia(message)) return;
   const text = getEffectiveAutoComment(channelId);
   if (!text) return;
-  await replyToMessage(channelId, message.id, text);
+
+  // Create a public thread on the message itself so the discussion lives
+  // INSIDE the post, not as a separate reply that clutters the channel.
+  // Discord thread name limit is 100 characters.
+  const threadName =
+    text.length > 100 ? text.slice(0, 97) + "..." : text;
+
+  await discordREST(
+    "POST",
+    `/channels/${channelId}/messages/${message.id}/threads`,
+    {
+      name: threadName,
+      auto_archive_duration: 1440, // 24 hours
+    },
+  );
 }
 
 function identify() {
