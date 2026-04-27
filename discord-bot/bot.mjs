@@ -39,6 +39,11 @@ const guildRoles = new Map(); // guildId -> Map<roleId, BigInt(permissions)>
 // Threads are conversation spaces — users must be free to chat there.
 const threadChannels = new Set();
 
+// Per-guild "active channel" restriction. When set, the bot only operates
+// inside that single channel for that guild. When unset, the bot is active
+// in every channel (legacy behaviour).
+const activeChannels = new Map(); // guildId -> channelId
+
 let ws = null;
 let heartbeatInterval = null;
 let heartbeatTimer = null;
@@ -440,6 +445,49 @@ async function handleCommand(message) {
     return true;
   }
 
+  // ===== Active channel commands (mods only) =====
+  if (content === "!قناة-تعيين") {
+    if (!hasModPermission(message)) {
+      await denyCommand(message);
+      return true;
+    }
+    const guildId = message.guild_id;
+    if (!guildId) return true;
+    activeChannels.set(guildId, channelId);
+    await sendMessage(
+      channelId,
+      `✅ **تم تفعيل البوت في هذه القناة فقط** <#${channelId}>\nسيتم تجاهل جميع القنوات الأخرى في هذا السيرفر.`,
+    );
+    return true;
+  }
+
+  if (content === "!قناة-الغاء") {
+    if (!hasModPermission(message)) {
+      await denyCommand(message);
+      return true;
+    }
+    const guildId = message.guild_id;
+    if (!guildId) return true;
+    activeChannels.delete(guildId);
+    await sendMessage(
+      channelId,
+      "♻️ **تم إلغاء التحديد** — البوت الآن يعمل في جميع القنوات.",
+    );
+    return true;
+  }
+
+  if (content === "!قناة-عرض") {
+    const guildId = message.guild_id;
+    const active = guildId ? activeChannels.get(guildId) : null;
+    await sendMessage(
+      channelId,
+      active
+        ? `📍 **القناة النشطة:** <#${active}>`
+        : "📍 لا توجد قناة محددة — البوت يعمل في جميع القنوات.",
+    );
+    return true;
+  }
+
   // ===== Help =====
   if (content === "!مساعده" || content === "!help") {
     await sendMessage(
@@ -465,6 +513,11 @@ async function handleCommand(message) {
         "`!تعليق-ايقاف` — ايقاف انشاء المناقشات",
         "`!تعليق-تشغيل` — اعادة تشغيلها",
         "`!تعليق-عرض` — عرض العنوان الحالي",
+        "",
+        "**تحديد قناة العمل (للمشرفين فقط):**",
+        "`!قناة-تعيين` — تشغيل البوت في هذه القناة فقط (تجاهل الباقي)",
+        "`!قناة-الغاء` — إلغاء التحديد (يعمل في كل القنوات)",
+        "`!قناة-عرض` — عرض القناة النشطة الحالية",
       ].join("\n"),
     );
     return true;
@@ -757,9 +810,23 @@ async function handleMessageCreate(message) {
   if (!message || !message.author) return;
   if (message.author.bot) return;
 
-  // 1. Commands always have priority and bypass the filter
+  // 1. Commands always have priority and bypass the filter (so admins
+  //    can manage settings — including the active-channel — from anywhere).
   const isCommand = await handleCommand(message);
   if (isCommand) return;
+
+  // 1b. If this guild has an active channel pinned, ignore everything
+  //     happening outside it.
+  const guildId = message.guild_id;
+  if (guildId) {
+    const activeId = activeChannels.get(guildId);
+    if (activeId && activeId !== message.channel_id) {
+      // Allow thread messages whose parent is the active channel? Threads
+      // are skipped anyway by later checks; a non-active channel simply
+      // means we do nothing here.
+      return;
+    }
+  }
 
   // 2. Enforce media-only filter (deletes + warns if violation)
   const wasFiltered = await enforceMediaFilter(message);
