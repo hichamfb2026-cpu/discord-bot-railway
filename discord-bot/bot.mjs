@@ -9,6 +9,7 @@ if (!TOKEN) {
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
 const API_BASE = "https://discord.com/api/v10";
 
+// GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT
 const INTENTS = (1 << 0) | (1 << 9) | (1 << 15);
 
 const DEFAULT_EMOJIS = [
@@ -17,6 +18,11 @@ const DEFAULT_EMOJIS = [
 ];
 
 let emojis = [...DEFAULT_EMOJIS];
+
+// Per-channel media-only filter: Set<channelId>
+const filteredChannels = new Set();
+// Per-channel auto comment on media posts: Map<channelId, string>
+const channelComments = new Map();
 
 let ws = null;
 let heartbeatInterval = null;
@@ -30,6 +36,9 @@ let reconnectAttempts = 0;
 const reactionQueue = [];
 let processingQueue = false;
 const REACTION_DELAY_MS = 450;
+
+const URL_REGEX =
+  /(https?:\/\/\S+|www\.\S+|discord\.gg\/\S+|\b[a-z0-9-]+\.(?:com|net|org|io|gg|co|me|app|xyz|dev|tv|to|ru|info|biz|tech|store|online|site|club|live|news|tube|stream|link|click|page|cc|us|eu|fr|de|uk)(?:\/\S*)?)/i;
 
 function parseEmoji(raw) {
   const customMatch = raw.match(/^<(a?):([a-zA-Z0-9_]+):(\d+)>$/);
@@ -130,14 +139,75 @@ async function processReactionQueue() {
   processingQueue = false;
 }
 
-async function sendMessage(channelId, content) {
-  return discordREST("POST", `/channels/${channelId}/messages`, { content });
+async function sendMessage(channelId, content, extra = {}) {
+  return discordREST("POST", `/channels/${channelId}/messages`, {
+    content,
+    ...extra,
+  });
+}
+
+async function replyToMessage(channelId, messageId, content) {
+  return discordREST("POST", `/channels/${channelId}/messages`, {
+    content,
+    message_reference: {
+      message_id: messageId,
+      channel_id: channelId,
+      fail_if_not_exists: false,
+    },
+    allowed_mentions: { parse: [], replied_user: true },
+  });
+}
+
+async function deleteMessage(channelId, messageId) {
+  return discordREST(
+    "DELETE",
+    `/channels/${channelId}/messages/${messageId}`,
+  );
+}
+
+function autoDeleteAfter(channelId, messageId, ms) {
+  setTimeout(() => {
+    deleteMessage(channelId, messageId).catch(() => {});
+  }, ms);
+}
+
+function hasMedia(message) {
+  if (!message.attachments || message.attachments.length === 0) return false;
+  return message.attachments.some((a) => {
+    const ct = (a.content_type || "").toLowerCase();
+    if (ct.startsWith("image/") || ct.startsWith("video/")) return true;
+    const filename = (a.filename || "").toLowerCase();
+    return /\.(png|jpe?g|gif|webp|bmp|svg|mp4|mov|webm|mkv|avi|m4v)$/i.test(
+      filename,
+    );
+  });
+}
+
+function containsURL(text) {
+  if (!text) return false;
+  return URL_REGEX.test(text);
+}
+
+function hasModPermission(message) {
+  if (!message.member || !message.member.permissions) return false;
+  try {
+    const perms = BigInt(message.member.permissions);
+    const ADMINISTRATOR = 1n << 3n;
+    const MANAGE_MESSAGES = 1n << 13n;
+    const MANAGE_CHANNELS = 1n << 4n;
+    return (
+      (perms & (ADMINISTRATOR | MANAGE_MESSAGES | MANAGE_CHANNELS)) !== 0n
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function handleCommand(message) {
   const content = (message.content || "").trim();
   const channelId = message.channel_id;
 
+  // ===== Emoji commands (open to everyone) =====
   if (content === "!ايموجي") {
     const list =
       emojis.length > 0
@@ -188,7 +258,10 @@ async function handleCommand(message) {
   if (content.startsWith("!ايموجي-غير")) {
     const args = content.slice("!ايموجي-غير".length).trim();
     if (!args) {
-      await sendMessage(channelId, "الاستخدام: `!ايموجي-غير <emoji1> <emoji2> ...`");
+      await sendMessage(
+        channelId,
+        "الاستخدام: `!ايموجي-غير <emoji1> <emoji2> ...`",
+      );
       return true;
     }
     const next = args.split(/\s+/).filter(Boolean);
@@ -206,7 +279,191 @@ async function handleCommand(message) {
     return true;
   }
 
+  // ===== Filter commands (mods only) =====
+  if (content === "!فلتر-تشغيل") {
+    if (!hasModPermission(message)) {
+      const m = await replyToMessage(
+        channelId,
+        message.id,
+        "❌ هذا الأمر مخصص للمشرفين فقط.",
+      );
+      if (m?.id) autoDeleteAfter(channelId, m.id, 6000);
+      return true;
+    }
+    filteredChannels.add(channelId);
+    await sendMessage(
+      channelId,
+      "✅ **تم تفعيل الفلتر في هذه القناة**\nمن الآن لا يُسمح إلا بنشر الصور أو الفيديوهات (مع كلمات اختيارياً). الروابط والرسائل النصية وحدها سيتم حذفها تلقائياً.",
+    );
+    return true;
+  }
+
+  if (content === "!فلتر-ايقاف") {
+    if (!hasModPermission(message)) {
+      const m = await replyToMessage(
+        channelId,
+        message.id,
+        "❌ هذا الأمر مخصص للمشرفين فقط.",
+      );
+      if (m?.id) autoDeleteAfter(channelId, m.id, 6000);
+      return true;
+    }
+    filteredChannels.delete(channelId);
+    await sendMessage(channelId, "🛑 تم إيقاف الفلتر في هذه القناة.");
+    return true;
+  }
+
+  if (content === "!فلتر-حالة") {
+    const on = filteredChannels.has(channelId);
+    const comment = channelComments.get(channelId);
+    const lines = [
+      `**حالة الفلتر:** ${on ? "✅ مفعّل" : "🛑 متوقف"}`,
+      `**التعليق التلقائي:** ${comment ? `\`\`\`\n${comment}\n\`\`\`` : "غير معيّن"}`,
+    ];
+    await sendMessage(channelId, lines.join("\n"));
+    return true;
+  }
+
+  // ===== Auto-comment commands (mods only) =====
+  if (content.startsWith("!تعليق-تعيين")) {
+    if (!hasModPermission(message)) {
+      const m = await replyToMessage(
+        channelId,
+        message.id,
+        "❌ هذا الأمر مخصص للمشرفين فقط.",
+      );
+      if (m?.id) autoDeleteAfter(channelId, m.id, 6000);
+      return true;
+    }
+    const args = content.slice("!تعليق-تعيين".length).trim();
+    if (!args) {
+      await sendMessage(channelId, "الاستخدام: `!تعليق-تعيين <نص التعليق>`");
+      return true;
+    }
+    if (args.length > 1500) {
+      await sendMessage(channelId, "❌ النص طويل جداً (الحد الأقصى 1500 حرف).");
+      return true;
+    }
+    channelComments.set(channelId, args);
+    await sendMessage(
+      channelId,
+      `✅ تم تعيين التعليق التلقائي لهذه القناة:\n\`\`\`\n${args}\n\`\`\``,
+    );
+    return true;
+  }
+
+  if (content === "!تعليق-حذف") {
+    if (!hasModPermission(message)) {
+      const m = await replyToMessage(
+        channelId,
+        message.id,
+        "❌ هذا الأمر مخصص للمشرفين فقط.",
+      );
+      if (m?.id) autoDeleteAfter(channelId, m.id, 6000);
+      return true;
+    }
+    const had = channelComments.delete(channelId);
+    await sendMessage(
+      channelId,
+      had ? "🗑️ تم حذف التعليق التلقائي." : "لا يوجد تعليق تلقائي معيّن.",
+    );
+    return true;
+  }
+
+  if (content === "!تعليق-عرض") {
+    const c = channelComments.get(channelId);
+    await sendMessage(
+      channelId,
+      c
+        ? `**التعليق التلقائي الحالي:**\n\`\`\`\n${c}\n\`\`\``
+        : "لا يوجد تعليق تلقائي معيّن لهذه القناة.",
+    );
+    return true;
+  }
+
+  // ===== Help =====
+  if (content === "!مساعده" || content === "!help") {
+    await sendMessage(
+      channelId,
+      [
+        "**📖 قائمة الأوامر:**",
+        "",
+        "**الايموجيات (متاح للجميع):**",
+        "`!ايموجي` — عرض الايموجيات الحالية",
+        "`!ايموجي-اضف <emoji>` — اضافة ايموجي",
+        "`!ايموجي-احذف <emoji>` — حذف ايموجي",
+        "`!ايموجي-غير <emoji1> <emoji2> ...` — تغيير القائمة",
+        "`!ايموجي-مسح` — مسح كل الايموجيات",
+        "",
+        "**الفلتر (للمشرفين فقط):**",
+        "`!فلتر-تشغيل` — تفعيل فلتر الوسائط في هذه القناة",
+        "`!فلتر-ايقاف` — ايقاف الفلتر",
+        "`!فلتر-حالة` — عرض حالة الفلتر والتعليق",
+        "",
+        "**التعليق التلقائي (للمشرفين فقط):**",
+        "`!تعليق-تعيين <نص>` — تعيين تعليق يُنشر تلقائياً تحت كل صورة/فيديو",
+        "`!تعليق-حذف` — حذف التعليق التلقائي",
+        "`!تعليق-عرض` — عرض التعليق التلقائي",
+      ].join("\n"),
+    );
+    return true;
+  }
+
   return false;
+}
+
+async function enforceMediaFilter(message) {
+  const channelId = message.channel_id;
+  if (!filteredChannels.has(channelId)) return false;
+
+  const content = message.content || "";
+  const media = hasMedia(message);
+  const linkInside = containsURL(content);
+
+  // Reset regex state (because /g could be added later)
+  URL_REGEX.lastIndex = 0;
+
+  let violation = null;
+  if (linkInside) {
+    violation = "links";
+  } else if (!media) {
+    violation = "text-only";
+  }
+
+  if (!violation) return false;
+
+  const deleted = await deleteMessage(channelId, message.id);
+  if (deleted === null) {
+    console.warn(
+      `[FILTER] failed to delete message ${message.id} in ${channelId} — check MANAGE_MESSAGES permission`,
+    );
+  }
+
+  const userMention = `<@${message.author.id}>`;
+  const reasonLine =
+    violation === "links"
+      ? "⛔ **لا يُسمح بإرسال الروابط في هذه القناة.**"
+      : "⛔ **لا يُسمح بإرسال الرسائل النصية وحدها في هذه القناة.**";
+
+  const warning = await sendMessage(
+    channelId,
+    [
+      `${userMention} ${reasonLine}`,
+      "🎬 يمكنك فقط نشر **صورة** أو **فيديو** (مع كلمات اختيارياً).",
+    ].join("\n"),
+    { allowed_mentions: { users: [message.author.id], parse: [] } },
+  );
+  if (warning?.id) autoDeleteAfter(channelId, warning.id, 8000);
+
+  return true;
+}
+
+async function postAutoComment(message) {
+  const channelId = message.channel_id;
+  const comment = channelComments.get(channelId);
+  if (!comment) return;
+  if (!hasMedia(message)) return;
+  await replyToMessage(channelId, message.id, comment);
 }
 
 function identify() {
@@ -361,7 +618,8 @@ function connect(url = GATEWAY_URL) {
     reconnectAttempts++;
     console.log(`[GATEWAY] reconnecting in ${delay}ms`);
     setTimeout(() => {
-      const nextUrl = sessionId && resumeGatewayUrl ? resumeGatewayUrl : GATEWAY_URL;
+      const nextUrl =
+        sessionId && resumeGatewayUrl ? resumeGatewayUrl : GATEWAY_URL;
       connect(nextUrl);
     }, delay);
   });
@@ -375,12 +633,23 @@ async function handleMessageCreate(message) {
   if (!message || !message.author) return;
   if (message.author.bot) return;
 
+  // 1. Commands always have priority and bypass the filter
   const isCommand = await handleCommand(message);
   if (isCommand) return;
 
+  // 2. Enforce media-only filter (deletes + warns if violation)
+  const wasFiltered = await enforceMediaFilter(message);
+  if (wasFiltered) return;
+
+  // 3. Add reactions to the surviving message
   for (const emoji of emojis) {
     enqueueReaction(message.channel_id, message.id, emoji);
   }
+
+  // 4. Auto-comment under media posts (if configured)
+  postAutoComment(message).catch((err) =>
+    console.error("[auto-comment] error:", err),
+  );
 }
 
 process.on("SIGINT", () => {
