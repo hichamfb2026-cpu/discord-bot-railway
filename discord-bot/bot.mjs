@@ -218,38 +218,18 @@ function getEffectiveAutoComment(channelId) {
   return channelComments.get(channelId) || DEFAULT_AUTO_COMMENT;
 }
 
-function hasModPermission(message) {
+function isGuildOwner(message) {
   const guildId = message.guild_id;
   if (!guildId) return false;
-
-  // Guild owner always has full permissions
   const ownerId = guildOwners.get(guildId);
-  if (ownerId && ownerId === message.author.id) return true;
-
-  const roleMap = guildRoles.get(guildId);
-  if (!roleMap) return false;
-
-  // Compute base permissions: @everyone role + all member roles
-  let perms = roleMap.get(guildId) ?? 0n;
-  const memberRoles = message.member?.roles || [];
-  for (const roleId of memberRoles) {
-    const rp = roleMap.get(roleId);
-    if (rp !== undefined) perms |= rp;
-  }
-
-  const ADMINISTRATOR = 1n << 3n;
-  const MANAGE_MESSAGES = 1n << 13n;
-  const MANAGE_CHANNELS = 1n << 4n;
-
-  if ((perms & ADMINISTRATOR) !== 0n) return true;
-  return (perms & (MANAGE_MESSAGES | MANAGE_CHANNELS)) !== 0n;
+  return !!ownerId && ownerId === message.author.id;
 }
 
 async function denyCommand(message) {
   const m = await replyToMessage(
     message.channel_id,
     message.id,
-    "❌ هذا الأمر مخصص للمشرفين فقط.",
+    "❌ هذا الأمر مخصص لمالك السيرفر فقط.",
   );
   if (m?.id) autoDeleteAfter(message.channel_id, m.id, 6000);
 }
@@ -269,6 +249,10 @@ async function handleCommand(message) {
   }
 
   if (content.startsWith("!ايموجي-اضف")) {
+    if (!isGuildOwner(message)) {
+      await denyCommand(message);
+      return true;
+    }
     const args = content.slice("!ايموجي-اضف".length).trim();
     if (!args) {
       await sendMessage(channelId, "الاستخدام: `!ايموجي-اضف <emoji>`");
@@ -290,6 +274,10 @@ async function handleCommand(message) {
   }
 
   if (content.startsWith("!ايموجي-احذف")) {
+    if (!isGuildOwner(message)) {
+      await denyCommand(message);
+      return true;
+    }
     const args = content.slice("!ايموجي-احذف".length).trim();
     if (!args) {
       await sendMessage(channelId, "الاستخدام: `!ايموجي-احذف <emoji>`");
@@ -307,6 +295,10 @@ async function handleCommand(message) {
   }
 
   if (content.startsWith("!ايموجي-غير")) {
+    if (!isGuildOwner(message)) {
+      await denyCommand(message);
+      return true;
+    }
     const args = content.slice("!ايموجي-غير".length).trim();
     if (!args) {
       await sendMessage(
@@ -325,6 +317,10 @@ async function handleCommand(message) {
   }
 
   if (content === "!ايموجي-مسح") {
+    if (!isGuildOwner(message)) {
+      await denyCommand(message);
+      return true;
+    }
     emojis = [];
     await sendMessage(channelId, "تم مسح جميع الايموجيات.");
     return true;
@@ -332,7 +328,7 @@ async function handleCommand(message) {
 
   // ===== Filter commands (mods only) =====
   if (content === "!فلتر-تشغيل") {
-    if (!hasModPermission(message)) {
+    if (!isGuildOwner(message)) {
       await denyCommand(message);
       return true;
     }
@@ -345,7 +341,7 @@ async function handleCommand(message) {
   }
 
   if (content === "!فلتر-ايقاف") {
-    if (!hasModPermission(message)) {
+    if (!isGuildOwner(message)) {
       await denyCommand(message);
       return true;
     }
@@ -374,7 +370,7 @@ async function handleCommand(message) {
 
   // ===== Auto-comment commands (mods only) =====
   if (content.startsWith("!تعليق-تعيين")) {
-    if (!hasModPermission(message)) {
+    if (!isGuildOwner(message)) {
       await denyCommand(message);
       return true;
     }
@@ -397,7 +393,7 @@ async function handleCommand(message) {
   }
 
   if (content === "!تعليق-افتراضي") {
-    if (!hasModPermission(message)) {
+    if (!isGuildOwner(message)) {
       await denyCommand(message);
       return true;
     }
@@ -411,7 +407,7 @@ async function handleCommand(message) {
   }
 
   if (content === "!تعليق-ايقاف") {
-    if (!hasModPermission(message)) {
+    if (!isGuildOwner(message)) {
       await denyCommand(message);
       return true;
     }
@@ -421,7 +417,7 @@ async function handleCommand(message) {
   }
 
   if (content === "!تعليق-تشغيل") {
-    if (!hasModPermission(message)) {
+    if (!isGuildOwner(message)) {
       await denyCommand(message);
       return true;
     }
@@ -447,7 +443,7 @@ async function handleCommand(message) {
 
   // ===== Active channel commands (mods only) =====
   if (content === "!قناة-تعيين") {
-    if (!hasModPermission(message)) {
+    if (!isGuildOwner(message)) {
       await denyCommand(message);
       return true;
     }
@@ -462,7 +458,7 @@ async function handleCommand(message) {
   }
 
   if (content === "!قناة-الغاء") {
-    if (!hasModPermission(message)) {
+    if (!isGuildOwner(message)) {
       await denyCommand(message);
       return true;
     }
@@ -495,29 +491,31 @@ async function handleCommand(message) {
       [
         "**📖 قائمة الأوامر:**",
         "",
-        "**الايموجيات (متاح للجميع):**",
-        "`!ايموجي` — عرض الايموجيات الحالية",
-        "`!ايموجي-اضف <emoji>` — اضافة ايموجي",
-        "`!ايموجي-احذف <emoji>` — حذف ايموجي",
-        "`!ايموجي-غير <emoji1> <emoji2> ...` — تغيير القائمة",
-        "`!ايموجي-مسح` — مسح كل الايموجيات",
+        "🔒 **جميع أوامر التحكم مخصصة لمالك السيرفر فقط** (لمنع التخريب).",
         "",
-        "**الفلتر (افتراضياً مفعّل في كل القنوات — للمشرفين فقط):**",
-        "`!فلتر-تشغيل` — اعادة تفعيل الفلتر",
-        "`!فلتر-ايقاف` — ايقاف الفلتر في هذه القناة",
-        "`!فلتر-حالة` — عرض حالة الفلتر والتعليق",
+        "**الايموجيات:**",
+        "`!ايموجي` — عرض الايموجيات الحالية (للجميع)",
+        "`!ايموجي-اضف <emoji>` — اضافة ايموجي 🔒",
+        "`!ايموجي-احذف <emoji>` — حذف ايموجي 🔒",
+        "`!ايموجي-غير <emoji1> <emoji2> ...` — تغيير القائمة 🔒",
+        "`!ايموجي-مسح` — مسح كل الايموجيات 🔒",
         "",
-        "**التعليق التلقائي — يُنشأ كـ مناقشة (Thread) داخل كل صورة/فيديو (افتراضياً مفعّل — للمشرفين فقط):**",
-        "`!تعليق-تعيين <نص>` — تعيين عنوان مخصص للمناقشة",
-        "`!تعليق-افتراضي` — اعادة استخدام العنوان الافتراضي",
-        "`!تعليق-ايقاف` — ايقاف انشاء المناقشات",
-        "`!تعليق-تشغيل` — اعادة تشغيلها",
-        "`!تعليق-عرض` — عرض العنوان الحالي",
+        "**الفلتر** (افتراضياً مفعّل في كل القنوات):",
+        "`!فلتر-تشغيل` — اعادة تفعيل الفلتر 🔒",
+        "`!فلتر-ايقاف` — ايقاف الفلتر في هذه القناة 🔒",
+        "`!فلتر-حالة` — عرض حالة الفلتر والتعليق (للجميع)",
         "",
-        "**تحديد قناة العمل (للمشرفين فقط):**",
-        "`!قناة-تعيين` — تشغيل البوت في هذه القناة فقط (تجاهل الباقي)",
-        "`!قناة-الغاء` — إلغاء التحديد (يعمل في كل القنوات)",
-        "`!قناة-عرض` — عرض القناة النشطة الحالية",
+        "**التعليق التلقائي** — يُنشأ كـ مناقشة (Thread) داخل كل صورة/فيديو:",
+        "`!تعليق-تعيين <نص>` — تعيين عنوان مخصص للمناقشة 🔒",
+        "`!تعليق-افتراضي` — اعادة استخدام العنوان الافتراضي 🔒",
+        "`!تعليق-ايقاف` — ايقاف انشاء المناقشات 🔒",
+        "`!تعليق-تشغيل` — اعادة تشغيلها 🔒",
+        "`!تعليق-عرض` — عرض العنوان الحالي (للجميع)",
+        "",
+        "**تحديد قناة العمل:**",
+        "`!قناة-تعيين` — تشغيل البوت في هذه القناة فقط (تجاهل الباقي) 🔒",
+        "`!قناة-الغاء` — إلغاء التحديد (يعمل في كل القنوات) 🔒",
+        "`!قناة-عرض` — عرض القناة النشطة الحالية (للجميع)",
       ].join("\n"),
     );
     return true;
