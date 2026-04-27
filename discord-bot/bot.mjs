@@ -1,10 +1,17 @@
 import WebSocket from "ws";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 const TOKEN = process.env.DISCORD_TOKEN;
 if (!TOKEN) {
   console.error("[FATAL] DISCORD_TOKEN environment variable is required");
   process.exit(1);
 }
+
+// Where the bot persists its settings between restarts/deploys.
+// On Railway, mount a Volume at /data and set STATE_FILE=/data/state.json
+// to make settings survive deploys.
+const STATE_FILE = process.env.STATE_FILE || "./state.json";
 
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
 const API_BASE = "https://discord.com/api/v10";
@@ -55,17 +62,94 @@ function freshStats() {
     reactionsAdded: 0,
     commandsUsed: 0,
     weekStartTime: Date.now(),
+    topPosters: {}, // userId -> count of media posts
   };
 }
 
 function getStats(guildId) {
   if (!stats.has(guildId)) stats.set(guildId, freshStats());
-  return stats.get(guildId);
+  const s = stats.get(guildId);
+  if (!s.topPosters) s.topPosters = {};
+  return s;
 }
 
 function bumpStat(guildId, key, n = 1) {
   if (!guildId) return;
   getStats(guildId)[key] += n;
+  scheduleSave();
+}
+
+function bumpPoster(guildId, userId) {
+  if (!guildId || !userId) return;
+  const s = getStats(guildId);
+  s.topPosters[userId] = (s.topPosters[userId] || 0) + 1;
+  scheduleSave();
+}
+
+function topPoster(s) {
+  let best = null;
+  for (const [uid, n] of Object.entries(s.topPosters || {})) {
+    if (!best || n > best.count) best = { userId: uid, count: n };
+  }
+  return best;
+}
+
+// ===== Persistence =====
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    saveState();
+  }, 2000);
+}
+
+function saveState() {
+  try {
+    const dir = dirname(STATE_FILE);
+    if (dir && dir !== ".") {
+      try {
+        mkdirSync(dir, { recursive: true });
+      } catch {}
+    }
+    const data = {
+      emojis,
+      disabledFilterChannels: [...disabledFilterChannels],
+      channelComments: Object.fromEntries(channelComments),
+      disabledCommentChannels: [...disabledCommentChannels],
+      activeChannels: Object.fromEntries(activeChannels),
+      stats: Object.fromEntries(stats),
+    };
+    writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.warn(`[STATE] save failed: ${err.message}`);
+  }
+}
+
+function loadState() {
+  try {
+    const raw = readFileSync(STATE_FILE, "utf8");
+    const data = JSON.parse(raw);
+    if (Array.isArray(data.emojis)) emojis = data.emojis;
+    for (const c of data.disabledFilterChannels || [])
+      disabledFilterChannels.add(c);
+    for (const [c, t] of Object.entries(data.channelComments || {}))
+      channelComments.set(c, t);
+    for (const c of data.disabledCommentChannels || [])
+      disabledCommentChannels.add(c);
+    for (const [g, c] of Object.entries(data.activeChannels || {}))
+      activeChannels.set(g, c);
+    for (const [g, s] of Object.entries(data.stats || {})) {
+      stats.set(g, { ...freshStats(), ...s });
+    }
+    console.log(`[STATE] loaded from ${STATE_FILE}`);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      console.log(`[STATE] no existing state file at ${STATE_FILE} (fresh start)`);
+    } else {
+      console.warn(`[STATE] load failed: ${err.message}`);
+    }
+  }
 }
 
 let ws = null;
@@ -210,37 +294,94 @@ async function deleteMessage(channelId, messageId) {
   );
 }
 
-function formatStatsReport(s, guildName = null) {
-  const start = new Date(s.weekStartTime);
-  const end = new Date();
-  const fmt = (d) =>
-    d.toLocaleString("ar-SA", {
-      timeZone: "Asia/Riyadh",
-      dateStyle: "medium",
-      timeStyle: "short",
-    });
-  const headerLine = guildName
-    ? `📊 **التقرير الأسبوعي — ${guildName}**`
-    : "📊 **التقرير الأسبوعي للبوت**";
-  return [
-    headerLine,
-    "━━━━━━━━━━━━━━━━━━━━━━━━━",
-    `📅 **الفترة:**`,
-    `   ${fmt(start)}`,
-    `   ←→`,
-    `   ${fmt(end)}`,
-    "━━━━━━━━━━━━━━━━━━━━━━━━━",
-    `📸 **منشورات صور/فيديو:** ${s.mediaPosts.toLocaleString("ar-SA")}`,
-    `🗑️ **رسائل محذوفة (مخالفات):** ${s.deletedMessages.toLocaleString("ar-SA")}`,
-    `💬 **مناقشات أُنشئت:** ${s.threadsCreated.toLocaleString("ar-SA")}`,
-    `✨ **تفاعلات أُضيفت:** ${s.reactionsAdded.toLocaleString("ar-SA")}`,
-    `⚙️ **أوامر استُخدمت:** ${s.commandsUsed.toLocaleString("ar-SA")}`,
-    "━━━━━━━━━━━━━━━━━━━━━━━━━",
-    "🤖 شكراً لاستخدامك البوت — نراك الأسبوع القادم!",
-  ].join("\n");
+function fmtNum(n) {
+  // Force Western/Latin digits with thousands grouping (e.g. 1,234)
+  return Number(n || 0).toLocaleString("en-US");
 }
 
-async function sendDM(userId, content) {
+function fmtRiyadhDate(date) {
+  // YYYY-MM-DD HH:MM in Riyadh timezone, Latin digits.
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Riyadh",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const get = (t) => parts.find((p) => p.type === t)?.value || "";
+  return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}`;
+}
+
+function buildStatsEmbed(s, opts = {}) {
+  const start = new Date(s.weekStartTime);
+  const end = new Date();
+  const top = topPoster(s);
+  const topField = top
+    ? `<@${top.userId}> — **${fmtNum(top.count)}** منشور`
+    : "_لا يوجد منشورات بعد._";
+
+  const periodLine =
+    `\`${fmtRiyadhDate(start)}\`  →  \`${fmtRiyadhDate(end)}\`\n` +
+    `*(بتوقيت السعودية)*`;
+
+  return {
+    title: opts.title || "📊 التقرير الأسبوعي للبوت",
+    description: `🗓️  **الفترة**\n${periodLine}`,
+    color: 0x5865f2, // Discord blurple
+    fields: [
+      {
+        name: "📸 المنشورات (صور/فيديو)",
+        value: `**${fmtNum(s.mediaPosts)}**`,
+        inline: true,
+      },
+      {
+        name: "🗑️ رسائل محذوفة",
+        value: `**${fmtNum(s.deletedMessages)}**`,
+        inline: true,
+      },
+      {
+        name: "💬 مناقشات أُنشئت",
+        value: `**${fmtNum(s.threadsCreated)}**`,
+        inline: true,
+      },
+      {
+        name: "✨ تفاعلات أُضيفت",
+        value: `**${fmtNum(s.reactionsAdded)}**`,
+        inline: true,
+      },
+      {
+        name: "⚙️ أوامر استُخدمت",
+        value: `**${fmtNum(s.commandsUsed)}**`,
+        inline: true,
+      },
+      {
+        name: "\u200B",
+        value: "\u200B",
+        inline: true,
+      },
+      {
+        name: "🏆 أكثر عضو نشاطاً هذا الأسبوع",
+        value: topField,
+        inline: false,
+      },
+    ],
+    footer: {
+      text: "🤖 يصلك تقرير جديد كل خميس 8:00ص بتوقيت السعودية",
+    },
+    timestamp: new Date().toISOString(),
+  };
+}
+
+async function sendStatsEmbed(channelId, embed) {
+  return discordREST("POST", `/channels/${channelId}/messages`, {
+    embeds: [embed],
+    allowed_mentions: { parse: [] }, // never ping the top poster
+  });
+}
+
+async function sendDM(userId, content, extra = {}) {
   try {
     const dm = await discordREST("POST", "/users/@me/channels", {
       recipient_id: userId,
@@ -248,6 +389,7 @@ async function sendDM(userId, content) {
     if (!dm?.id) return null;
     return await discordREST("POST", `/channels/${dm.id}/messages`, {
       content,
+      ...extra,
     });
   } catch {
     return null;
@@ -317,7 +459,10 @@ async function handleCommand(message) {
       return true;
     }
     const s = getStats(message.guild_id);
-    await sendMessage(channelId, formatStatsReport(s));
+    const embed = buildStatsEmbed(s, {
+      title: "📊 إحصائيات الأسبوع الجارية",
+    });
+    await sendStatsEmbed(channelId, embed);
     return true;
   }
 
@@ -600,7 +745,8 @@ async function handleCommand(message) {
         "",
         "**الإحصائيات:**",
         "`!احصائيات` — عرض إحصائيات الأسبوع الجارية 🔒",
-        "📅 يصلك تقرير أسبوعي تلقائي كل خميس الساعة 8:00 صباحاً (توقيت السعودية) في الخاص.",
+        "📅 يُنشر تقرير أسبوعي تلقائي **داخل القناة النشطة** كل خميس الساعة 8:00 صباحاً (بتوقيت السعودية).",
+        "   *(إن لم تُحدِّد قناة بـ `!قناة-تعيين`، سيُرسَل لك في الخاص)*",
       ].join("\n");
 
     // Send the menu via DM so it doesn't pollute the posts channel,
@@ -943,6 +1089,7 @@ async function handleMessageCreate(message) {
   if (hasMedia(message)) {
     bumpStat(message.guild_id, "mediaPosts");
     bumpStat(message.guild_id, "reactionsAdded", emojis.length);
+    bumpPoster(message.guild_id, message.author.id);
   }
 
   // 3. Add reactions to the surviving message
@@ -958,12 +1105,14 @@ async function handleMessageCreate(message) {
 
 process.on("SIGINT", () => {
   console.log("[PROCESS] SIGINT received, shutting down");
+  saveState();
   if (ws) ws.close(1000, "shutdown");
   process.exit(0);
 });
 
 process.on("SIGTERM", () => {
   console.log("[PROCESS] SIGTERM received, shutting down");
+  saveState();
   if (ws) ws.close(1000, "shutdown");
   process.exit(0);
 });
@@ -991,12 +1140,31 @@ function msUntilNextThursday8AMRiyadh() {
 
 async function sendWeeklyReports() {
   console.log("[STATS] sending weekly reports");
-  for (const [guildId, ownerId] of guildOwners.entries()) {
+  // Iterate every guild we know about (from stats OR active channels OR owners)
+  const guildIds = new Set([
+    ...guildOwners.keys(),
+    ...activeChannels.keys(),
+    ...stats.keys(),
+  ]);
+  for (const guildId of guildIds) {
     try {
       const s = getStats(guildId);
-      const report = formatStatsReport(s);
-      await sendDM(ownerId, report);
+      const embed = buildStatsEmbed(s);
+      const channelId = activeChannels.get(guildId);
+      let delivered = false;
+      if (channelId) {
+        const res = await sendStatsEmbed(channelId, embed);
+        delivered = !!res?.id;
+      }
+      // Fallback: DM the owner if no active channel or send failed.
+      if (!delivered) {
+        const ownerId = guildOwners.get(guildId);
+        if (ownerId) {
+          await sendDM(ownerId, "", { embeds: [embed] });
+        }
+      }
       stats.set(guildId, freshStats());
+      scheduleSave();
     } catch (err) {
       console.error(
         `[STATS] failed to send report for guild ${guildId}:`,
@@ -1024,5 +1192,6 @@ function scheduleWeeklyReports() {
   }, delay);
 }
 
+loadState();
 scheduleWeeklyReports();
 connect();
