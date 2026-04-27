@@ -44,6 +44,30 @@ const threadChannels = new Set();
 // in every channel (legacy behaviour).
 const activeChannels = new Map(); // guildId -> channelId
 
+// Per-guild rolling stats. Reset every time the weekly report is sent.
+const stats = new Map(); // guildId -> stats object
+
+function freshStats() {
+  return {
+    mediaPosts: 0,
+    deletedMessages: 0,
+    threadsCreated: 0,
+    reactionsAdded: 0,
+    commandsUsed: 0,
+    weekStartTime: Date.now(),
+  };
+}
+
+function getStats(guildId) {
+  if (!stats.has(guildId)) stats.set(guildId, freshStats());
+  return stats.get(guildId);
+}
+
+function bumpStat(guildId, key, n = 1) {
+  if (!guildId) return;
+  getStats(guildId)[key] += n;
+}
+
 let ws = null;
 let heartbeatInterval = null;
 let heartbeatTimer = null;
@@ -186,6 +210,36 @@ async function deleteMessage(channelId, messageId) {
   );
 }
 
+function formatStatsReport(s, guildName = null) {
+  const start = new Date(s.weekStartTime);
+  const end = new Date();
+  const fmt = (d) =>
+    d.toLocaleString("ar-SA", {
+      timeZone: "Asia/Riyadh",
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+  const headerLine = guildName
+    ? `📊 **التقرير الأسبوعي — ${guildName}**`
+    : "📊 **التقرير الأسبوعي للبوت**";
+  return [
+    headerLine,
+    "━━━━━━━━━━━━━━━━━━━━━━━━━",
+    `📅 **الفترة:**`,
+    `   ${fmt(start)}`,
+    `   ←→`,
+    `   ${fmt(end)}`,
+    "━━━━━━━━━━━━━━━━━━━━━━━━━",
+    `📸 **منشورات صور/فيديو:** ${s.mediaPosts.toLocaleString("ar-SA")}`,
+    `🗑️ **رسائل محذوفة (مخالفات):** ${s.deletedMessages.toLocaleString("ar-SA")}`,
+    `💬 **مناقشات أُنشئت:** ${s.threadsCreated.toLocaleString("ar-SA")}`,
+    `✨ **تفاعلات أُضيفت:** ${s.reactionsAdded.toLocaleString("ar-SA")}`,
+    `⚙️ **أوامر استُخدمت:** ${s.commandsUsed.toLocaleString("ar-SA")}`,
+    "━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "🤖 شكراً لاستخدامك البوت — نراك الأسبوع القادم!",
+  ].join("\n");
+}
+
 async function sendDM(userId, content) {
   try {
     const dm = await discordREST("POST", "/users/@me/channels", {
@@ -251,6 +305,21 @@ async function denyCommand(message) {
 async function handleCommand(message) {
   const content = (message.content || "").trim();
   const channelId = message.channel_id;
+
+  if (content.startsWith("!")) {
+    bumpStat(message.guild_id, "commandsUsed");
+  }
+
+  // ===== Stats command (owner only) =====
+  if (content === "!احصائيات") {
+    if (!isGuildOwner(message)) {
+      await denyCommand(message);
+      return true;
+    }
+    const s = getStats(message.guild_id);
+    await sendMessage(channelId, formatStatsReport(s));
+    return true;
+  }
 
   // ===== Emoji commands (open to everyone) =====
   if (content === "!ايموجي") {
@@ -528,15 +597,14 @@ async function handleCommand(message) {
         "`!قناة-تعيين` — تشغيل البوت في هذه القناة فقط (تجاهل الباقي) 🔒",
         "`!قناة-الغاء` — إلغاء التحديد (يعمل في كل القنوات) 🔒",
         "`!قناة-عرض` — عرض القناة النشطة الحالية (للجميع)",
+        "",
+        "**الإحصائيات:**",
+        "`!احصائيات` — عرض إحصائيات الأسبوع الجارية 🔒",
+        "📅 يصلك تقرير أسبوعي تلقائي كل خميس الساعة 8:00 صباحاً (توقيت السعودية) في الخاص.",
       ].join("\n");
 
-    // Smart cleanup: keep the posts channel pristine.
-    //   1. Delete the user's "!مساعده" command immediately.
-    //   2. DM the help text to the user (zero channel pollution).
-    //   3. If the user has DMs disabled, fall back to a self-deleting
-    //      reply in the channel (60s).
-    deleteMessage(channelId, message.id).catch(() => {});
-
+    // Send the menu via DM so it doesn't pollute the posts channel,
+    // but DO NOT touch the user's command message.
     const dmResult = await sendDM(message.author.id, helpText);
 
     if (dmResult?.id) {
@@ -583,6 +651,8 @@ async function enforceMediaFilter(message) {
     console.warn(
       `[FILTER] failed to delete message ${message.id} in ${channelId} — check MANAGE_MESSAGES permission`,
     );
+  } else {
+    bumpStat(message.guild_id, "deletedMessages");
   }
 
   const userMention = `<@${message.author.id}>`;
@@ -629,6 +699,7 @@ async function postAutoComment(message) {
   // inside it (THREAD_CREATE may arrive after the first user reply).
   if (thread?.id) {
     threadChannels.add(thread.id);
+    bumpStat(message.guild_id, "threadsCreated");
     await sendMessage(thread.id, text);
   }
 }
@@ -868,6 +939,12 @@ async function handleMessageCreate(message) {
   // Threads are discussion spaces — never react or open new threads there.
   if (threadChannels.has(message.channel_id)) return;
 
+  // Only count and decorate real media posts (filter already let it through).
+  if (hasMedia(message)) {
+    bumpStat(message.guild_id, "mediaPosts");
+    bumpStat(message.guild_id, "reactionsAdded", emojis.length);
+  }
+
   // 3. Add reactions to the surviving message
   for (const emoji of emojis) {
     enqueueReaction(message.channel_id, message.id, emoji);
@@ -895,4 +972,57 @@ process.on("unhandledRejection", (err) => {
   console.error("[PROCESS] unhandled rejection:", err);
 });
 
+// ===== Weekly stats report =====
+// Every Thursday at 08:00 Saudi Arabia time (UTC+3 → 05:00 UTC),
+// DM each guild owner an elegant report of the past week's activity,
+// then reset that guild's counters.
+function msUntilNextThursday8AMRiyadh() {
+  const now = new Date();
+  const target = new Date();
+  target.setUTCHours(5, 0, 0, 0); // 05:00 UTC == 08:00 Riyadh
+  // Day-of-week in UTC: 0=Sun … 4=Thu
+  let daysAhead = (4 - target.getUTCDay() + 7) % 7;
+  if (daysAhead === 0 && now.getTime() >= target.getTime()) {
+    daysAhead = 7;
+  }
+  target.setUTCDate(target.getUTCDate() + daysAhead);
+  return target.getTime() - now.getTime();
+}
+
+async function sendWeeklyReports() {
+  console.log("[STATS] sending weekly reports");
+  for (const [guildId, ownerId] of guildOwners.entries()) {
+    try {
+      const s = getStats(guildId);
+      const report = formatStatsReport(s);
+      await sendDM(ownerId, report);
+      stats.set(guildId, freshStats());
+    } catch (err) {
+      console.error(
+        `[STATS] failed to send report for guild ${guildId}:`,
+        err?.message || err,
+      );
+    }
+  }
+}
+
+function scheduleWeeklyReports() {
+  const delay = msUntilNextThursday8AMRiyadh();
+  const hours = (delay / 3600000).toFixed(1);
+  console.log(`[STATS] next weekly report in ~${hours}h`);
+  setTimeout(() => {
+    sendWeeklyReports().catch((err) =>
+      console.error("[STATS] weekly run error:", err),
+    );
+    setInterval(
+      () =>
+        sendWeeklyReports().catch((err) =>
+          console.error("[STATS] weekly run error:", err),
+        ),
+      7 * 24 * 60 * 60 * 1000,
+    );
+  }, delay);
+}
+
+scheduleWeeklyReports();
 connect();
