@@ -765,6 +765,9 @@ async function handleMessageCreate(message) {
   const wasFiltered = await enforceMediaFilter(message);
   if (wasFiltered) return;
 
+  // Threads are discussion spaces — never react or open new threads there.
+  if (threadChannels.has(message.channel_id)) return;
+
   // 3. Add reactions to the surviving message
   for (const emoji of emojis) {
     enqueueReaction(message.channel_id, message.id, emoji);
