@@ -186,6 +186,20 @@ async function deleteMessage(channelId, messageId) {
   );
 }
 
+async function sendDM(userId, content) {
+  try {
+    const dm = await discordREST("POST", "/users/@me/channels", {
+      recipient_id: userId,
+    });
+    if (!dm?.id) return null;
+    return await discordREST("POST", `/channels/${dm.id}/messages`, {
+      content,
+    });
+  } catch {
+    return null;
+  }
+}
+
 function autoDeleteAfter(channelId, messageId, ms) {
   setTimeout(() => {
     deleteMessage(channelId, messageId).catch(() => {});
@@ -486,9 +500,7 @@ async function handleCommand(message) {
 
   // ===== Help =====
   if (content === "!مساعده" || content === "!help") {
-    await sendMessage(
-      channelId,
-      [
+    const helpText = [
         "**📖 قائمة الأوامر:**",
         "",
         "🔒 **جميع أوامر التحكم مخصصة لمالك السيرفر فقط** (لمنع التخريب).",
@@ -516,8 +528,31 @@ async function handleCommand(message) {
         "`!قناة-تعيين` — تشغيل البوت في هذه القناة فقط (تجاهل الباقي) 🔒",
         "`!قناة-الغاء` — إلغاء التحديد (يعمل في كل القنوات) 🔒",
         "`!قناة-عرض` — عرض القناة النشطة الحالية (للجميع)",
-      ].join("\n"),
-    );
+      ].join("\n");
+
+    // Smart cleanup: keep the posts channel pristine.
+    //   1. Delete the user's "!مساعده" command immediately.
+    //   2. DM the help text to the user (zero channel pollution).
+    //   3. If the user has DMs disabled, fall back to a self-deleting
+    //      reply in the channel (60s).
+    deleteMessage(channelId, message.id).catch(() => {});
+
+    const dmResult = await sendDM(message.author.id, helpText);
+
+    if (dmResult?.id) {
+      const ack = await sendMessage(
+        channelId,
+        `<@${message.author.id}> 📬 تم إرسال قائمة الأوامر إلى رسائلك الخاصة.`,
+      );
+      if (ack?.id) autoDeleteAfter(channelId, ack.id, 5000);
+    } else {
+      // Couldn't DM (likely DMs closed) — post in channel and self-clean.
+      const fallback = await sendMessage(
+        channelId,
+        `<@${message.author.id}> ⚠️ لم أستطع مراسلتك في الخاص. (افتح الخاص ثم أعد المحاولة)\n\n${helpText}`,
+      );
+      if (fallback?.id) autoDeleteAfter(channelId, fallback.id, 60000);
+    }
     return true;
   }
 
