@@ -17,7 +17,7 @@ const DEFAULT_EMOJIS = [
   "<:emoji_4:1498045619128766696>",
 ];
 
-const DEFAULT_AUTO_COMMENT = "💬 ناقشوا المنشور هنا — شاركونا آراءكم";
+const DEFAULT_AUTO_COMMENT = "اكتبوا آراءكم عن المنشور فقط";
 
 let emojis = [...DEFAULT_EMOJIS];
 
@@ -524,7 +524,7 @@ async function postAutoComment(message) {
   const threadName =
     text.length > 100 ? text.slice(0, 97) + "..." : text;
 
-  await discordREST(
+  const thread = await discordREST(
     "POST",
     `/channels/${channelId}/messages/${message.id}/threads`,
     {
@@ -532,6 +532,12 @@ async function postAutoComment(message) {
       auto_archive_duration: 1440, // 24 hours
     },
   );
+
+  // Post the comment as a starter message INSIDE the thread so users
+  // immediately see the prompt when they open it.
+  if (thread?.id) {
+    await sendMessage(thread.id, text);
+  }
 }
 
 function identify() {
