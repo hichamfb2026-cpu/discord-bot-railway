@@ -35,6 +35,10 @@ const disabledCommentChannels = new Set();
 const guildOwners = new Map(); // guildId -> ownerId
 const guildRoles = new Map(); // guildId -> Map<roleId, BigInt(permissions)>
 
+// Track thread channel IDs so the media filter ignores them entirely.
+// Threads are conversation spaces — users must be free to chat there.
+const threadChannels = new Set();
+
 let ws = null;
 let heartbeatInterval = null;
 let heartbeatTimer = null;
@@ -471,6 +475,8 @@ async function handleCommand(message) {
 
 async function enforceMediaFilter(message) {
   const channelId = message.channel_id;
+  // Threads are dedicated discussion spaces — never filter messages there.
+  if (threadChannels.has(channelId)) return false;
   if (!isFilterEnabled(channelId)) return false;
 
   const content = message.content || "";
@@ -533,9 +539,10 @@ async function postAutoComment(message) {
     },
   );
 
-  // Post the comment as a starter message INSIDE the thread so users
-  // immediately see the prompt when they open it.
+  // Register the thread immediately so the filter never touches messages
+  // inside it (THREAD_CREATE may arrive after the first user reply).
   if (thread?.id) {
+    threadChannels.add(thread.id);
     await sendMessage(thread.id, text);
   }
 }
@@ -606,6 +613,17 @@ function ingestGuild(d) {
     } catch {}
   }
   guildRoles.set(d.id, roleMap);
+
+  // Discord includes active threads in GUILD_CREATE; cache their IDs so
+  // we can recognize them in MESSAGE_CREATE and skip the media filter.
+  for (const thread of d.threads || []) {
+    if (thread?.id) threadChannels.add(thread.id);
+  }
+}
+
+function isThreadType(type) {
+  // 10 = ANNOUNCEMENT_THREAD, 11 = PUBLIC_THREAD, 12 = PRIVATE_THREAD
+  return type === 10 || type === 11 || type === 12;
 }
 
 function connect(url = GATEWAY_URL) {
@@ -685,6 +703,14 @@ function connect(url = GATEWAY_URL) {
         } else if (t === "GUILD_ROLE_DELETE") {
           const roleMap = guildRoles.get(d.guild_id);
           if (roleMap) roleMap.delete(d.role_id);
+        } else if (t === "THREAD_CREATE" || t === "THREAD_UPDATE") {
+          if (d?.id) threadChannels.add(d.id);
+        } else if (t === "THREAD_DELETE") {
+          if (d?.id) threadChannels.delete(d.id);
+        } else if (t === "THREAD_LIST_SYNC") {
+          for (const thread of d.threads || []) {
+            if (thread?.id) threadChannels.add(thread.id);
+          }
         } else if (t === "MESSAGE_CREATE") {
           handleMessageCreate(d).catch((err) =>
             console.error("[handler] error:", err),
