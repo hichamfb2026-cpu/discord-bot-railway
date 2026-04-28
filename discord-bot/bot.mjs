@@ -1,5 +1,5 @@
 // =====================================================================
-// Discord Stream Notifications Bot
+// Discord Stream Notifications Bot — v2.1 (Kick proxy cascade)
 // ---------------------------------------------------------------------
 // Watches YouTube channels and Kick streamers and posts a notification
 // inside a Discord channel the moment a stream goes live.
