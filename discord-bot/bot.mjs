@@ -318,13 +318,36 @@ async function checkYouTubeLive(channelId) {
 // We try the JSON API first (fast, clean), then fall back to scraping HTML.
 // =====================================================================
 
-const KICK_HEADERS = {
+// Headers that closely mimic a real Chrome browser on desktop. Cloudflare's
+// bot detection looks at the *combination* of these — sending only User-Agent
+// is a giveaway. Note: we deliberately omit `Accept-Encoding: br` because
+// Node's global fetch on some hosts has historically had brotli quirks.
+const KICK_BROWSER_HEADERS = {
   "User-Agent": BROWSER_UA,
   Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate",
   "Cache-Control": "no-cache",
   Pragma: "no-cache",
+  "sec-ch-ua":
+    '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "none",
+  "Sec-Fetch-User": "?1",
+  "Upgrade-Insecure-Requests": "1",
+};
+
+const KICK_API_HEADERS = {
+  ...KICK_BROWSER_HEADERS,
+  Accept: "application/json, text/plain, */*",
+  Referer: "https://kick.com/",
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-origin",
 };
 
 function cleanKickInput(raw) {
@@ -345,27 +368,54 @@ function cleanKickInput(raw) {
 
 async function fetchKickPage(slug) {
   const url = `https://kick.com/${encodeURIComponent(slug)}`;
-  const res = await fetch(url, { headers: KICK_HEADERS, redirect: "follow" });
-  if (res.status === 404) return { ok: false, status: 404 };
-  if (!res.ok) return { ok: false, status: res.status };
-  const html = await res.text();
-  return { ok: true, html };
+  try {
+    const res = await fetch(url, {
+      headers: KICK_BROWSER_HEADERS,
+      redirect: "follow",
+    });
+    if (res.status === 404) {
+      console.warn(`[kick:html] ${slug} -> 404 (channel does not exist)`);
+      return { ok: false, status: 404 };
+    }
+    if (!res.ok) {
+      const snippet = await res.text().then((t) => t.slice(0, 200));
+      console.warn(
+        `[kick:html] ${slug} -> ${res.status} | snippet: ${snippet.replace(/\s+/g, " ")}`,
+      );
+      return { ok: false, status: res.status };
+    }
+    const html = await res.text();
+    return { ok: true, html };
+  } catch (err) {
+    console.error(`[kick:html] ${slug} fetch error:`, err.message);
+    return { ok: false, status: 0 };
+  }
 }
 
-async function fetchKickChannelApi(slug) {
-  // Best-effort JSON API. Returns null on any non-200 (incl. CF blocks).
+async function fetchKickChannelApi(slug, version = "v2") {
+  // Returns parsed channel object on success, null otherwise.
+  // Logs the failure reason in detail so Railway logs reveal CF blocks.
+  const url = `https://kick.com/api/${version}/channels/${encodeURIComponent(slug)}`;
   try {
-    const res = await fetch(
-      `https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`,
-      {
-        headers: { ...KICK_HEADERS, Accept: "application/json" },
-      },
-    );
-    if (!res.ok) return null;
+    const res = await fetch(url, { headers: KICK_API_HEADERS });
     const ct = res.headers.get("content-type") || "";
-    if (!ct.includes("application/json")) return null;
+    if (!res.ok) {
+      const snippet = await res.text().then((t) => t.slice(0, 200));
+      console.warn(
+        `[kick:${version}] ${slug} -> ${res.status} ct=${ct} | snippet: ${snippet.replace(/\s+/g, " ")}`,
+      );
+      return null;
+    }
+    if (!ct.includes("application/json")) {
+      const snippet = await res.text().then((t) => t.slice(0, 200));
+      console.warn(
+        `[kick:${version}] ${slug} -> 200 but content-type=${ct} (likely CF challenge) | snippet: ${snippet.replace(/\s+/g, " ")}`,
+      );
+      return null;
+    }
     return await res.json();
-  } catch {
+  } catch (err) {
+    console.error(`[kick:${version}] ${slug} fetch error:`, err.message);
     return null;
   }
 }
@@ -429,64 +479,71 @@ function decodeUnicodeEscapes(s) {
   );
 }
 
-async function resolveKickChannel(input) {
-  const slug = cleanKickInput(input);
-  if (!slug) return null;
+// Cascade through every available source until one succeeds.
+// Returns { source, data } where data is in API-shape (with .slug, .user, .livestream).
+async function fetchKickChannel(slug) {
+  // 1) v2 API (richest data)
+  const v2 = await fetchKickChannelApi(slug, "v2");
+  if (v2) return { source: "api-v2", data: v2 };
 
-  // 1) Try JSON API — fast and clean when available.
-  const api = await fetchKickChannelApi(slug);
-  if (api && api.slug) {
-    return {
-      slug: api.slug.toLowerCase(),
-      displayName: api.user?.username || api.slug,
-    };
-  }
+  // 2) v1 API (legacy, often less aggressively gated)
+  const v1 = await fetchKickChannelApi(slug, "v1");
+  if (v1) return { source: "api-v1", data: v1 };
 
-  // 2) Fallback: scrape public HTML page (works when Cloudflare blocks API).
+  // 3) HTML page scrape — works when both APIs are CF-blocked
   const page = await fetchKickPage(slug);
-  if (!page.ok) {
-    console.error(`[kick] resolve failed: HTTP ${page.status} for ${slug}`);
-    return null;
-  }
+  if (!page.ok) return null;
   const parsed = parseKickHtml(page.html, slug);
   if (!parsed) {
-    console.error(`[kick] resolve: page loaded but no channel data for ${slug}`);
+    console.error(
+      `[kick] HTML loaded for ${slug} but channel data not found (page may be CF challenge or layout changed)`,
+    );
     return null;
   }
-  return { slug: parsed.slug, displayName: parsed.displayName };
+  // Reshape into API-like object
+  return {
+    source: "html",
+    data: {
+      slug: parsed.slug,
+      user: { username: parsed.displayName },
+      livestream: parsed.livestream,
+      _thumbnail: parsed.thumbnail,
+    },
+  };
+}
+
+async function resolveKickChannel(input) {
+  const slug = cleanKickInput(input);
+  if (!slug) {
+    console.warn(`[kick] resolve: empty/invalid input "${input}"`);
+    return null;
+  }
+  const result = await fetchKickChannel(slug);
+  if (!result) {
+    console.error(`[kick] resolve: all sources failed for ${slug}`);
+    return null;
+  }
+  console.log(`[kick] resolve: ${slug} via ${result.source}`);
+  return {
+    slug: (result.data.slug || slug).toLowerCase(),
+    displayName: result.data.user?.username || result.data.slug || slug,
+  };
 }
 
 async function checkKickLive(slug) {
-  // Try API first.
-  const api = await fetchKickChannelApi(slug);
-  if (api) {
-    if (!api.livestream) return { live: false };
-    const ls = api.livestream;
-    return {
-      live: true,
-      streamId: ls.id,
-      title: ls.session_title || "بث مباشر",
-      url: `https://kick.com/${api.slug || slug}`,
-      thumbnail: ls.thumbnail?.url || null,
-      viewers: ls.viewer_count || 0,
-      startedAt: ls.created_at || null,
-    };
-  }
-
-  // Fallback: HTML page.
-  const page = await fetchKickPage(slug);
-  if (!page.ok) return { live: false };
-  const parsed = parseKickHtml(page.html, slug);
-  if (!parsed || !parsed.livestream) return { live: false };
-  const ls = parsed.livestream;
+  const result = await fetchKickChannel(slug);
+  if (!result) return { live: false };
+  const data = result.data;
+  if (!data.livestream) return { live: false };
+  const ls = data.livestream;
   return {
     live: true,
     streamId: ls.id,
-    title: ls.session_title,
-    url: `https://kick.com/${slug}`,
-    thumbnail: parsed.thumbnail,
-    viewers: ls.viewer_count,
-    startedAt: ls.created_at,
+    title: ls.session_title || "بث مباشر",
+    url: `https://kick.com/${data.slug || slug}`,
+    thumbnail: ls.thumbnail?.url || data._thumbnail || null,
+    viewers: ls.viewer_count || 0,
+    startedAt: ls.created_at || null,
   };
 }
 
@@ -664,6 +721,7 @@ function helpText() {
     "**الإعدادات:**",
     "`!قناة-اشعارات` — تعيين هذه القناة لاستقبال الإشعارات 🔒",
     "`!حالة` — عرض القناة النشطة وعدد المتابعات",
+    "`!تشخيص-كيك <اسم>` — فحص الاتصال بـ Kick لتشخيص المشاكل 🔒",
     "`!مساعده` — عرض هذه القائمة في الخاص",
     "",
     "🔒 = متاح لمالك السيرفر فقط",
@@ -760,9 +818,65 @@ async function handleCommand(msg) {
   // From here on: owner-only commands
   // -------------------------------------------------------------------
   if (!guildId || !isGuildOwner(guildId, userId)) {
-    if (cmd.startsWith("!اضف-") || cmd.startsWith("!احذف-") || cmd === "!قناة-اشعارات") {
+    if (
+      cmd.startsWith("!اضف-") ||
+      cmd.startsWith("!احذف-") ||
+      cmd === "!قناة-اشعارات" ||
+      cmd === "!تشخيص-كيك"
+    ) {
       await denyNotOwner(channelId, messageId);
     }
+    return;
+  }
+
+  // ---- Diagnostic: probe Kick endpoints for a slug ----
+  if (cmd === "!تشخيص-كيك" || cmd === "!debug-kick") {
+    const slug = cleanKickInput(args);
+    if (!slug) {
+      await sendMessage(channelId, "📝 الاستخدام: `!تشخيص-كيك <اسم القناة>`");
+      return;
+    }
+    const wait = await sendMessage(channelId, `🔬 فحص \`${slug}\` على ثلاث نقاط...`);
+    const lines = [];
+    for (const version of ["v2", "v1"]) {
+      try {
+        const url = `https://kick.com/api/${version}/channels/${slug}`;
+        const r = await fetch(url, { headers: KICK_API_HEADERS });
+        const ct = r.headers.get("content-type") || "?";
+        lines.push(`• **API ${version}** → \`${r.status}\` (\`${ct.split(";")[0]}\`)`);
+      } catch (e) {
+        lines.push(`• **API ${version}** → خطأ: ${e.message}`);
+      }
+    }
+    try {
+      const r = await fetch(`https://kick.com/${slug}`, {
+        headers: KICK_BROWSER_HEADERS,
+        redirect: "follow",
+      });
+      const ct = r.headers.get("content-type") || "?";
+      let extra = "";
+      if (r.ok) {
+        const html = await r.text();
+        const found = html.includes(`\\"slug\\":\\"${slug.toLowerCase()}\\"`);
+        extra = found ? " ✅ بيانات القناة موجودة" : " ⚠️ بيانات غير موجودة";
+      }
+      lines.push(`• **HTML page** → \`${r.status}\` (\`${ct.split(";")[0]}\`)${extra}`);
+    } catch (e) {
+      lines.push(`• **HTML page** → خطأ: ${e.message}`);
+    }
+    if (wait) deleteMessage(channelId, wait.id).catch(() => {});
+    await sendMessage(channelId, "", {
+      embeds: [
+        {
+          title: `🔬 تشخيص Kick — ${slug}`,
+          description: lines.join("\n"),
+          color: 0x53fc18,
+          footer: {
+            text: "200/json = نجاح • 403/text = حظر Cloudflare • 404 = القناة غير موجودة",
+          },
+        },
+      ],
+    });
     return;
   }
 
