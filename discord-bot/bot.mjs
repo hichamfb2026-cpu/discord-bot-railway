@@ -366,56 +366,124 @@ function cleanKickInput(raw) {
   return input;
 }
 
-async function fetchKickPage(slug) {
-  const url = `https://kick.com/${encodeURIComponent(slug)}`;
-  try {
-    const res = await fetch(url, {
-      headers: KICK_BROWSER_HEADERS,
-      redirect: "follow",
-    });
-    if (res.status === 404) {
-      console.warn(`[kick:html] ${slug} -> 404 (channel does not exist)`);
-      return { ok: false, status: 404 };
+// =====================================================================
+// Kick fetch helpers — direct + proxy fallbacks
+// ---------------------------------------------------------------------
+// Cloudflare blocks datacenter IPs (Railway/Render/Replit) on direct
+// requests. We try direct first, then route through two CORS/reverse
+// proxies that forward the request from a different IP range.
+// =====================================================================
+
+/**
+ * Build candidate URLs for fetching a Kick target through different routes.
+ * Returns an array: [direct, allorigins, corsproxy]
+ */
+function kickProxyUrls(targetUrl) {
+  const encoded = encodeURIComponent(targetUrl);
+  return [
+    // 1) Direct — works on residential IPs or if CF relaxes
+    { label: "direct", url: targetUrl, proxy: false },
+    // 2) allorigins — free proxy, returns JSON wrapper { contents, status }
+    {
+      label: "allorigins",
+      url: `https://api.allorigins.win/get?url=${encoded}`,
+      proxy: "allorigins",
+    },
+    // 3) corsproxy.io — returns raw body, proxied
+    {
+      label: "corsproxy",
+      url: `https://corsproxy.io/?${encoded}`,
+      proxy: "corsproxy",
+    },
+  ];
+}
+
+/**
+ * Fetch a URL trying direct first, then proxies.
+ * Returns { text, fromProxy } or null on complete failure.
+ */
+async function fetchWithProxyFallback(targetUrl, headers = {}, timeoutMs = 12000) {
+  const candidates = kickProxyUrls(targetUrl);
+  for (const { label, url, proxy } of candidates) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const res = await fetch(url, {
+        headers: proxy ? {} : headers, // proxies don't forward custom headers
+        redirect: "follow",
+        signal: controller.signal,
+      }).finally(() => clearTimeout(timer));
+
+      if (!res.ok) {
+        console.warn(`[kick:${label}] ${targetUrl} -> ${res.status}`);
+        continue;
+      }
+
+      let text;
+      if (proxy === "allorigins") {
+        // allorigins wraps response: { contents: "...", status: { http_code: 200 } }
+        const json = await res.json().catch(() => null);
+        if (!json || !json.contents) {
+          console.warn(`[kick:${label}] empty contents`);
+          continue;
+        }
+        if (json.status?.http_code === 403) {
+          console.warn(`[kick:${label}] proxied 403`);
+          continue;
+        }
+        text = json.contents;
+      } else {
+        text = await res.text();
+      }
+
+      // Detect Cloudflare challenge page (even through proxy)
+      if (
+        text.includes("Just a moment") ||
+        text.includes("cf-browser-verification") ||
+        text.includes("_cf_chl_")
+      ) {
+        console.warn(`[kick:${label}] CF challenge page detected`);
+        continue;
+      }
+
+      console.log(`[kick:${label}] success for ${targetUrl}`);
+      return { text, fromProxy: label };
+    } catch (err) {
+      console.warn(`[kick:${label}] error: ${err.message}`);
     }
-    if (!res.ok) {
-      const snippet = await res.text().then((t) => t.slice(0, 200));
-      console.warn(
-        `[kick:html] ${slug} -> ${res.status} | snippet: ${snippet.replace(/\s+/g, " ")}`,
-      );
-      return { ok: false, status: res.status };
-    }
-    const html = await res.text();
-    return { ok: true, html };
-  } catch (err) {
-    console.error(`[kick:html] ${slug} fetch error:`, err.message);
-    return { ok: false, status: 0 };
   }
+  return null;
+}
+
+async function fetchKickPage(slug) {
+  const targetUrl = `https://kick.com/${encodeURIComponent(slug)}`;
+  const result = await fetchWithProxyFallback(targetUrl, KICK_BROWSER_HEADERS);
+  if (!result) return { ok: false, status: 403 };
+
+  // 404 detection inside HTML (Kick returns 200 with "not found" page sometimes)
+  if (result.text.includes('"statusCode":404') || result.text.includes("page not found")) {
+    console.warn(`[kick:html] ${slug} -> 404 (channel does not exist)`);
+    return { ok: false, status: 404 };
+  }
+
+  return { ok: true, html: result.text };
 }
 
 async function fetchKickChannelApi(slug, version = "v2") {
-  // Returns parsed channel object on success, null otherwise.
-  // Logs the failure reason in detail so Railway logs reveal CF blocks.
-  const url = `https://kick.com/api/${version}/channels/${encodeURIComponent(slug)}`;
+  const targetUrl = `https://kick.com/api/${version}/channels/${encodeURIComponent(slug)}`;
+  const result = await fetchWithProxyFallback(targetUrl, KICK_API_HEADERS);
+  if (!result) return null;
+
   try {
-    const res = await fetch(url, { headers: KICK_API_HEADERS });
-    const ct = res.headers.get("content-type") || "";
-    if (!res.ok) {
-      const snippet = await res.text().then((t) => t.slice(0, 200));
-      console.warn(
-        `[kick:${version}] ${slug} -> ${res.status} ct=${ct} | snippet: ${snippet.replace(/\s+/g, " ")}`,
-      );
+    const data = JSON.parse(result.text);
+    // Kick API returns { message: "..." } on error
+    if (data && data.message && !data.slug && !data.user) {
+      console.warn(`[kick:api-${version}] ${slug} -> API error: ${data.message}`);
       return null;
     }
-    if (!ct.includes("application/json")) {
-      const snippet = await res.text().then((t) => t.slice(0, 200));
-      console.warn(
-        `[kick:${version}] ${slug} -> 200 but content-type=${ct} (likely CF challenge) | snippet: ${snippet.replace(/\s+/g, " ")}`,
-      );
-      return null;
-    }
-    return await res.json();
-  } catch (err) {
-    console.error(`[kick:${version}] ${slug} fetch error:`, err.message);
+    return data;
+  } catch {
+    console.warn(`[kick:api-${version}] ${slug} -> invalid JSON via ${result.fromProxy}`);
     return null;
   }
 }
@@ -836,34 +904,63 @@ async function handleCommand(msg) {
       await sendMessage(channelId, "📝 الاستخدام: `!تشخيص-كيك <اسم القناة>`");
       return;
     }
-    const wait = await sendMessage(channelId, `🔬 فحص \`${slug}\` على ثلاث نقاط...`);
+    const wait = await sendMessage(channelId, `🔬 فحص \`${slug}\` عبر المسارات المتاحة...`);
     const lines = [];
-    for (const version of ["v2", "v1"]) {
+
+    // Test API v2 with full proxy cascade
+    const apiTarget = `https://kick.com/api/v2/channels/${slug}`;
+    for (const { label, url, proxy } of kickProxyUrls(apiTarget)) {
       try {
-        const url = `https://kick.com/api/${version}/channels/${slug}`;
-        const r = await fetch(url, { headers: KICK_API_HEADERS });
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 10000);
+        const r = await fetch(url, {
+          headers: proxy ? {} : KICK_API_HEADERS,
+          signal: controller.signal,
+        }).finally(() => clearTimeout(t));
         const ct = r.headers.get("content-type") || "?";
-        lines.push(`• **API ${version}** → \`${r.status}\` (\`${ct.split(";")[0]}\`)`);
+        const status = r.status;
+        let note = "";
+        if (r.ok && ct.includes("json")) {
+          const json = await r.json().catch(() => null);
+          const innerStatus = proxy === "allorigins" ? json?.status?.http_code : status;
+          note = json?.slug ? " ✅ بيانات صحيحة" : (innerStatus === 403 ? " 🔴 CF حجب" : " ⚠️ رد غريب");
+        } else if (status === 403) {
+          note = " 🔴 Cloudflare حجب";
+        } else if (status === 404) {
+          note = " ⚠️ قناة غير موجودة";
+        }
+        lines.push(`• **API v2 [${label}]** → \`${status}\`${note}`);
       } catch (e) {
-        lines.push(`• **API ${version}** → خطأ: ${e.message}`);
+        lines.push(`• **API v2 [${label}]** → ❌ ${e.message.slice(0, 60)}`);
       }
     }
-    try {
-      const r = await fetch(`https://kick.com/${slug}`, {
-        headers: KICK_BROWSER_HEADERS,
-        redirect: "follow",
-      });
-      const ct = r.headers.get("content-type") || "?";
-      let extra = "";
-      if (r.ok) {
-        const html = await r.text();
-        const found = html.includes(`\\"slug\\":\\"${slug.toLowerCase()}\\"`);
-        extra = found ? " ✅ بيانات القناة موجودة" : " ⚠️ بيانات غير موجودة";
+
+    // Test HTML page with full proxy cascade
+    const htmlTarget = `https://kick.com/${slug}`;
+    for (const { label, url, proxy } of kickProxyUrls(htmlTarget)) {
+      try {
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 10000);
+        const r = await fetch(url, {
+          headers: proxy ? {} : KICK_BROWSER_HEADERS,
+          signal: controller.signal,
+        }).finally(() => clearTimeout(t));
+        let text = "";
+        if (proxy === "allorigins") {
+          const j = await r.json().catch(() => null);
+          text = j?.contents || "";
+        } else if (r.ok) {
+          text = await r.text();
+        }
+        const isCF = text.includes("Just a moment") || text.includes("_cf_chl_");
+        const hasData = text.includes(`\\"slug\\":\\"${slug}\\"`);
+        const note = isCF ? " 🔴 CF challenge" : hasData ? " ✅ بيانات موجودة" : r.ok ? " ⚠️ لا بيانات" : "";
+        lines.push(`• **HTML [${label}]** → \`${r.status}\`${note}`);
+      } catch (e) {
+        lines.push(`• **HTML [${label}]** → ❌ ${e.message.slice(0, 60)}`);
       }
-      lines.push(`• **HTML page** → \`${r.status}\` (\`${ct.split(";")[0]}\`)${extra}`);
-    } catch (e) {
-      lines.push(`• **HTML page** → خطأ: ${e.message}`);
     }
+
     if (wait) deleteMessage(channelId, wait.id).catch(() => {});
     await sendMessage(channelId, "", {
       embeds: [
@@ -872,7 +969,7 @@ async function handleCommand(msg) {
           description: lines.join("\n"),
           color: 0x53fc18,
           footer: {
-            text: "200/json = نجاح • 403/text = حظر Cloudflare • 404 = القناة غير موجودة",
+            text: "✅ = نجاح • 🔴 = Cloudflare حجب • ⚠️ = مشكلة أخرى",
           },
         },
       ],
