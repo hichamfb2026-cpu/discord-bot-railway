@@ -200,7 +200,9 @@ async function sendDM(userId, content, extra = {}) {
  * and parsing meta tags + embedded JSON.
  */
 async function resolveYouTubeChannel(input) {
-  const trimmed = String(input || "").trim();
+  let trimmed = String(input || "").trim();
+  // Discord wraps URLs in <…> to suppress embeds — strip those.
+  trimmed = trimmed.replace(/^<+/, "").replace(/>+$/, "");
   if (!trimmed) return null;
 
   // 1) Direct UCxxxxxxxxxxxxxxxxxxxxxx
@@ -306,63 +308,186 @@ async function checkYouTubeLive(channelId) {
 }
 
 // =====================================================================
-// Kick live detection (public JSON API)
+// Kick live detection
+// ---------------------------------------------------------------------
+// Kick's official JSON API (kick.com/api/v2/channels/<slug>) is fronted
+// by Cloudflare and routinely blocks server/datacenter IPs (e.g. Railway)
+// with a 403 "challenge" page. The public HTML page kick.com/<slug>
+// contains the same channel + livestream data embedded as escaped JSON
+// inside Next.js streaming chunks, and is far more permissive.
+// We try the JSON API first (fast, clean), then fall back to scraping HTML.
 // =====================================================================
 
-async function fetchKickChannel(slug) {
-  const url = `https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": BROWSER_UA,
-      Accept: "application/json",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    throw new Error(`Kick API ${res.status}`);
-  }
-  return res.json();
+const KICK_HEADERS = {
+  "User-Agent": BROWSER_UA,
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Cache-Control": "no-cache",
+  Pragma: "no-cache",
+};
+
+function cleanKickInput(raw) {
+  let input = String(raw || "").trim();
+  // Discord wraps URLs in <…> to suppress embeds — strip those.
+  input = input.replace(/^<+/, "").replace(/>+$/, "");
+  // <@123> Discord mention — not valid for us.
+  if (/^@?!?\d+$/.test(input)) return "";
+  // If user pasted full URL, take the last meaningful segment.
+  const urlMatch = input.match(/kick\.com\/([a-zA-Z0-9_-]+)/i);
+  if (urlMatch) input = urlMatch[1];
+  // Drop leading @ and lowercase (Kick slugs are case-insensitive).
+  input = input.replace(/^@/, "").toLowerCase();
+  // Slug allowed characters
+  if (!/^[a-z0-9_-]{2,30}$/.test(input)) return "";
+  return input;
 }
 
-async function resolveKickChannel(input) {
-  let slug = String(input || "").trim();
-  if (!slug) return null;
-  // Accept full URLs like https://kick.com/xqc
-  const m = slug.match(/kick\.com\/([a-zA-Z0-9_-]+)/);
-  if (m) slug = m[1];
-  slug = slug.replace(/^@/, "").toLowerCase();
+async function fetchKickPage(slug) {
+  const url = `https://kick.com/${encodeURIComponent(slug)}`;
+  const res = await fetch(url, { headers: KICK_HEADERS, redirect: "follow" });
+  if (res.status === 404) return { ok: false, status: 404 };
+  if (!res.ok) return { ok: false, status: res.status };
+  const html = await res.text();
+  return { ok: true, html };
+}
+
+async function fetchKickChannelApi(slug) {
+  // Best-effort JSON API. Returns null on any non-200 (incl. CF blocks).
   try {
-    const data = await fetchKickChannel(slug);
-    if (!data) return null;
-    return {
-      slug: data.slug || slug,
-      displayName: data.user?.username || data.slug || slug,
-    };
-  } catch (err) {
-    console.error("[kick] resolve failed:", err.message);
+    const res = await fetch(
+      `https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`,
+      {
+        headers: { ...KICK_HEADERS, Accept: "application/json" },
+      },
+    );
+    if (!res.ok) return null;
+    const ct = res.headers.get("content-type") || "";
+    if (!ct.includes("application/json")) return null;
+    return await res.json();
+  } catch {
     return null;
   }
 }
 
+/**
+ * Parses the Next.js HTML page of a Kick channel and extracts:
+ *   { slug, displayName, livestream, thumbnail }
+ * livestream is null when offline.
+ */
+function parseKickHtml(html, slug) {
+  // Confirm the page actually represents the requested channel.
+  // Kick HTML escapes JSON as \"slug\":\"<value>\".
+  const slugLit = slug.toLowerCase();
+  const slugRe = new RegExp(
+    `\\\\"slug\\\\":\\\\"${slugLit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\\\"`,
+    "i",
+  );
+  if (!slugRe.test(html)) return null;
+
+  // Proper-cased username from the embedded user object.
+  const userMatch = html.match(
+    /\\"user\\":\{[^}]*?\\"username\\":\\"([^"\\]+)\\"/,
+  );
+  const displayName = userMatch ? decodeHtml(userMatch[1]) : slug;
+
+  // Livestream block (only present when channel has any livestream object,
+  // which is also the case when offline if there's a previous one — so we
+  // must additionally check is_live:true).
+  let livestream = null;
+  const liveMatch = html.match(/\\"livestream\\":\{([^}]{0,2000})\}/);
+  if (liveMatch) {
+    const block = liveMatch[1];
+    const isLiveM = block.match(/\\"is_live\\":(true|false)/);
+    const idM = block.match(/\\"id\\":(\d+)/);
+    if (isLiveM && isLiveM[1] === "true" && idM) {
+      const titleM = block.match(/\\"session_title\\":\\"([^\\]{0,300})/);
+      const viewerM = block.match(/\\"viewer_count\\":(\d+)/);
+      const startM = block.match(/\\"start_time\\":\\"([^\\]+?)\\"/);
+      livestream = {
+        id: parseInt(idM[1], 10),
+        session_title: titleM ? decodeUnicodeEscapes(titleM[1]) : "بث مباشر",
+        viewer_count: viewerM ? parseInt(viewerM[1], 10) : 0,
+        created_at: startM ? startM[1] : null,
+      };
+    }
+  }
+
+  // Thumbnail — pick the first webp under images.kick.com/video_thumbnails
+  let thumbnail = null;
+  const thumbMatch = html.match(
+    /(https:\/\/images\.kick\.com\/video_thumbnails\/[^"\\\s]+\.webp(?:\?[^"\\\s]*)?)/,
+  );
+  if (thumbMatch) thumbnail = thumbMatch[1];
+
+  return { slug: slugLit, displayName, livestream, thumbnail };
+}
+
+function decodeUnicodeEscapes(s) {
+  return String(s).replace(/\\u([0-9a-fA-F]{4})/g, (_, h) =>
+    String.fromCharCode(parseInt(h, 16)),
+  );
+}
+
+async function resolveKickChannel(input) {
+  const slug = cleanKickInput(input);
+  if (!slug) return null;
+
+  // 1) Try JSON API — fast and clean when available.
+  const api = await fetchKickChannelApi(slug);
+  if (api && api.slug) {
+    return {
+      slug: api.slug.toLowerCase(),
+      displayName: api.user?.username || api.slug,
+    };
+  }
+
+  // 2) Fallback: scrape public HTML page (works when Cloudflare blocks API).
+  const page = await fetchKickPage(slug);
+  if (!page.ok) {
+    console.error(`[kick] resolve failed: HTTP ${page.status} for ${slug}`);
+    return null;
+  }
+  const parsed = parseKickHtml(page.html, slug);
+  if (!parsed) {
+    console.error(`[kick] resolve: page loaded but no channel data for ${slug}`);
+    return null;
+  }
+  return { slug: parsed.slug, displayName: parsed.displayName };
+}
+
 async function checkKickLive(slug) {
-  try {
-    const data = await fetchKickChannel(slug);
-    if (!data || !data.livestream) return { live: false };
-    const ls = data.livestream;
+  // Try API first.
+  const api = await fetchKickChannelApi(slug);
+  if (api) {
+    if (!api.livestream) return { live: false };
+    const ls = api.livestream;
     return {
       live: true,
       streamId: ls.id,
       title: ls.session_title || "بث مباشر",
-      url: `https://kick.com/${data.slug || slug}`,
+      url: `https://kick.com/${api.slug || slug}`,
       thumbnail: ls.thumbnail?.url || null,
       viewers: ls.viewer_count || 0,
       startedAt: ls.created_at || null,
     };
-  } catch (err) {
-    console.error(`[kick] live check failed for ${slug}:`, err.message);
-    return { live: false };
   }
+
+  // Fallback: HTML page.
+  const page = await fetchKickPage(slug);
+  if (!page.ok) return { live: false };
+  const parsed = parseKickHtml(page.html, slug);
+  if (!parsed || !parsed.livestream) return { live: false };
+  const ls = parsed.livestream;
+  return {
+    live: true,
+    streamId: ls.id,
+    title: ls.session_title,
+    url: `https://kick.com/${slug}`,
+    thumbnail: parsed.thumbnail,
+    viewers: ls.viewer_count,
+    startedAt: ls.created_at,
+  };
 }
 
 // =====================================================================
